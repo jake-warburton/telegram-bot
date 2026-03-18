@@ -313,4 +313,8 @@ async function main() {
   });
 }
 
-main();
+// Only run when executed directly, not when imported by tests
+const isDirectRun = process.argv[1]?.endsWith('bot.ts');
+if (isDirectRun) {
+  main();
+}
