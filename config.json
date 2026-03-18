@@ -13,9 +13,7 @@
       "description": "Run Codex CLI"
     }
   },
-  "projects": [
-    "/Users/jakewarburton/Documents/repos/telegram-bot"
-  ],
+  "projects_dir": "/Users/jakewarburton/Documents/repos",
   "default_project": "/Users/jakewarburton/Documents/repos/telegram-bot",
   "command_timeout_ms": 300000
 }

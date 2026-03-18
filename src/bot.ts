@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { exec, spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -16,6 +16,14 @@ interface CliTool {
   description: string;
 }
 
+interface RawConfig {
+  cli_tools: Record<string, CliTool>;
+  projects_dir?: string;
+  projects?: string[];
+  default_project: string;
+  command_timeout_ms: number;
+}
+
 interface Config {
   cli_tools: Record<string, CliTool>;
   projects: string[];
@@ -24,7 +32,20 @@ interface Config {
 }
 
 export function loadConfig(path: string): Config {
-  return JSON.parse(readFileSync(path, 'utf-8'));
+  const raw: RawConfig = JSON.parse(readFileSync(path, 'utf-8'));
+
+  let projects = raw.projects ?? [];
+  if (raw.projects_dir) {
+    const dirs = readdirSync(raw.projects_dir)
+      .map((name) => join(raw.projects_dir!, name))
+      .filter((p) => {
+        try { return statSync(p).isDirectory(); } catch { return false; }
+      })
+      .sort();
+    projects = [...projects, ...dirs];
+  }
+
+  return { ...raw, projects };
 }
 
 // --- Pure helpers ---
