@@ -1,0 +1,21 @@
+{
+  "cli_tools": {
+    "claude": {
+      "command": "claude",
+      "args": ["--print"],
+      "promptArg": "append",
+      "description": "Run Claude Code CLI"
+    },
+    "codex": {
+      "command": "codex",
+      "args": ["--quiet"],
+      "promptArg": "append",
+      "description": "Run Codex CLI"
+    }
+  },
+  "projects": [
+    "/Users/jakewarburton/Documents/repos/telegram-bot"
+  ],
+  "default_project": "/Users/jakewarburton/Documents/repos/telegram-bot",
+  "command_timeout_ms": 300000
+}
