@@ -443,8 +443,18 @@ async function main() {
         console.error(`Failed to send startup message to ${userId}: ${err.message}`);
       });
     }
+    if (state.chatActive) {
+      for (const userId of allowedUsers) {
+        bot.sendMessage(userId, 'Previous chat session was interrupted by restart.').catch(() => {});
+      }
+    }
   } else {
     console.log('Startup message suppressed (cooldown)');
+  }
+
+  if (state.chatActive) {
+    state.chatActive = false;
+    saveState(statePath, state);
   }
 
   // Log all incoming messages
@@ -611,6 +621,8 @@ async function main() {
         isFirstMessage: true,
         busy: false,
       };
+      state.chatActive = true;
+      saveState(statePath, state);
       bot.sendMessage(msg.chat.id, `Chat mode started with claude in ${basename(currentProject)}. Send messages directly — no /command prefix needed.\n/endchat to exit.`);
     }),
   );
@@ -630,6 +642,8 @@ async function main() {
         isFirstMessage: true,
         busy: false,
       };
+      state.chatActive = true;
+      saveState(statePath, state);
       bot.sendMessage(msg.chat.id, `Chat mode started with claude (yolo) in ${basename(currentProject)}. Send messages directly — no /command prefix needed.\n/endchat to exit.`);
     }),
   );
@@ -643,6 +657,8 @@ async function main() {
         return;
       }
       chatSession = null;
+      state.chatActive = false;
+      saveState(statePath, state);
       bot.sendMessage(msg.chat.id, 'Chat session ended.');
     }),
   );
