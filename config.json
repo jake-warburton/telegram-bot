@@ -2,18 +2,30 @@
   "cli_tools": {
     "claude": {
       "command": "claude",
-      "args": ["--print"],
+      "args": ["--print", "--verbose", "--output-format", "stream-json"],
       "promptArg": "append",
       "description": "Run Claude Code CLI"
+    },
+    "claudeyolo": {
+      "command": "claude",
+      "args": ["--print", "--verbose", "--dangerously-skip-permissions", "--output-format", "stream-json"],
+      "promptArg": "append",
+      "description": "Run Claude Code CLI (skip permissions)"
     },
     "codex": {
       "command": "codex",
       "args": ["--quiet"],
       "promptArg": "append",
       "description": "Run Codex CLI"
+    },
+    "codexyolo": {
+      "command": "codex",
+      "args": ["--quiet", "--full-auto"],
+      "promptArg": "append",
+      "description": "Run Codex CLI (full auto)"
     }
   },
   "projects_dir": "/Users/jakewarburton/Documents/repos",
   "default_project": "/Users/jakewarburton/Documents/repos/telegram-bot",
-  "command_timeout_ms": 300000
+  "command_timeout_ms": 600000
 }

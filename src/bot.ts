@@ -715,14 +715,14 @@ async function main() {
     );
     chatSession.activeHandle = handle;
 
-    // Accumulate streamed text and update Telegram message periodically
+    // Accumulate streamed content and update Telegram message periodically
+    let streamedThinking = '';
     let streamedText = '';
-    let lastUpdateText = '';
+    let lastDisplay = '';
     let phase: 'thinking' | 'responding' = 'thinking';
 
     handle.events.on('thinking', (delta: string) => {
-      // We don't stream thinking to the live message — too noisy
-      // It'll be sent separately at the end if present
+      streamedThinking += delta;
     });
 
     handle.events.on('text', (delta: string) => {
@@ -730,17 +730,21 @@ async function main() {
       streamedText += delta;
     });
 
-    // Periodically edit the Telegram message with accumulated text
+    // Periodically edit the Telegram message with accumulated content
     const updateInterval = setInterval(async () => {
-      if (streamedText && streamedText !== lastUpdateText) {
-        const display = phase === 'thinking'
-          ? 'Thinking...'
-          : truncateForTelegram(streamedText);
-        lastUpdateText = streamedText;
-        try {
-          await bot.editMessageText(display, { chat_id: chatId, message_id: msgId });
-        } catch {}
+      let display: string;
+      if (phase === 'responding' && streamedText) {
+        display = truncateForTelegram(streamedText);
+      } else if (streamedThinking) {
+        display = truncateForTelegram('Thinking...\n\n' + streamedThinking);
+      } else {
+        return; // nothing to show yet
       }
+      if (display === lastDisplay) return;
+      lastDisplay = display;
+      try {
+        await bot.editMessageText(display, { chat_id: chatId, message_id: msgId });
+      } catch {}
     }, STREAM_UPDATE_INTERVAL_MS);
 
     try {
