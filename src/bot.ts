@@ -431,10 +431,20 @@ async function main() {
   console.log('Listening for messages...');
 
   // Notify allowed users that the bot has started
-  for (const userId of allowedUsers) {
-    bot.sendMessage(userId, `Bot started. CWD: ${basename(currentProject)}`).catch((err: any) => {
-      console.error(`Failed to send startup message to ${userId}: ${err.message}`);
-    });
+  const now = Date.now();
+  const STARTUP_COOLDOWN_MS = 30_000;
+  const suppressStartupMsg = (now - state.lastStartTime) < STARTUP_COOLDOWN_MS;
+  state.lastStartTime = now;
+  saveState(statePath, state);
+
+  if (!suppressStartupMsg) {
+    for (const userId of allowedUsers) {
+      bot.sendMessage(userId, `Bot started. CWD: ${basename(currentProject)}`).catch((err: any) => {
+        console.error(`Failed to send startup message to ${userId}: ${err.message}`);
+      });
+    }
+  } else {
+    console.log('Startup message suppressed (cooldown)');
   }
 
   // Log all incoming messages
