@@ -392,7 +392,22 @@ async function main() {
   const state = loadState(statePath);
   let currentProject = state.currentProject || config.default_project;
 
-  const bot = new TelegramBot(token, { polling: true });
+  const bot = new TelegramBot(token, {
+    polling: {
+      params: state.lastUpdateId > 0
+        ? { offset: state.lastUpdateId + 1 }
+        : undefined,
+    },
+  });
+
+  const origProcessUpdate = bot.processUpdate.bind(bot);
+  (bot as any).processUpdate = (update: TelegramBot.Update) => {
+    origProcessUpdate(update);
+    if (update.update_id > state.lastUpdateId) {
+      state.lastUpdateId = update.update_id;
+      saveState(statePath, state);
+    }
+  };
 
   // Register commands with Telegram's autocomplete menu
   const botCommands: TelegramBot.BotCommand[] = [
