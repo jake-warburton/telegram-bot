@@ -94,7 +94,7 @@ function runCliTool(
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const fullCommand = [command, ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
-    const proc = spawn('/bin/zsh', ['-l', '-c', fullCommand], {
+    const proc = spawn('/bin/zsh', ['-li', '-c', fullCommand], {
       cwd,
     });
 
@@ -107,7 +107,12 @@ function runCliTool(
     let stderr = '';
 
     proc.stdout.on('data', (data) => (stdout += data));
-    proc.stderr.on('data', (data) => (stderr += data));
+    proc.stderr.on('data', (data) => {
+      const line = data.toString();
+      if (!line.includes('no stdin data received')) {
+        stderr += line;
+      }
+    });
 
     proc.on('close', (code) => {
       clearTimeout(timer);
