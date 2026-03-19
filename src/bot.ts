@@ -93,10 +93,9 @@ function runCliTool(
   timeoutMs: number,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(command, args, {
+    const fullCommand = [command, ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+    const proc = spawn('/bin/zsh', ['-l', '-c', fullCommand], {
       cwd,
-      shell: '/bin/zsh',
-      env: { ...process.env, PATH: process.env.PATH },
     });
 
     const timer = setTimeout(() => {
@@ -175,6 +174,9 @@ async function main() {
       command: name,
       description: tool.description,
     })),
+    { command: 'chat', description: 'Start interactive Claude chat' },
+    { command: 'chatyolo', description: 'Start Claude chat (skip permissions)' },
+    { command: 'endchat', description: 'End chat session' },
     { command: 'run', description: 'Run a shell command' },
     { command: 'status', description: 'System status' },
     { command: 'projects', description: 'List project directories' },
@@ -183,14 +185,23 @@ async function main() {
   ];
   await bot.setMyCommands(botCommands);
 
-  console.log('Bot started. Listening for messages...');
+  console.log(`Bot started. Allowed users: ${JSON.stringify(allowedUsers)}`);
+  console.log('Listening for messages...');
+
+  // Log all incoming messages
+  bot.on('message', (msg) => {
+    console.log(`Message from ${msg.from?.id} (${msg.from?.username}): ${msg.text}`);
+  });
 
   // Auth guard — wraps every handler
   function authed(
     handler: (msg: TelegramBot.Message, match: RegExpExecArray | null) => void,
   ) {
     return (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
-      if (!msg.from || !isAllowedUser(msg.from.id, allowedUsers)) return;
+      if (!msg.from || !isAllowedUser(msg.from.id, allowedUsers)) {
+        console.log(`Rejected: user ${msg.from?.id} not in allowlist`);
+        return;
+      }
       handler(msg, match);
     };
   }
@@ -288,6 +299,9 @@ async function main() {
       const text = [
         'Available commands:',
         toolCmds,
+        '/chat — Start interactive Claude chat',
+        '/chatyolo — Start Claude chat (skip permissions)',
+        '/endchat — End chat session',
         '/run <cmd> — Run a shell command',
         '/status — System status',
         '/projects — List project directories',
@@ -296,6 +310,67 @@ async function main() {
       ].join('\n');
 
       bot.sendMessage(msg.chat.id, text);
+    }),
+  );
+
+  // --- Chat mode state ---
+  interface ChatSession {
+    command: string;
+    args: string[];  // base args (e.g. ["--print", "--dangerously-skip-permissions"])
+    isFirstMessage: boolean;
+    busy: boolean;
+  }
+
+  let chatSession: ChatSession | null = null;
+
+  // --- /chat ---
+  bot.onText(
+    /^\/chat$/,
+    authed((msg) => {
+      const tool = config.cli_tools['claude'];
+      if (!tool) {
+        bot.sendMessage(msg.chat.id, 'No "claude" tool configured.');
+        return;
+      }
+      chatSession = {
+        command: tool.command,
+        args: [...tool.args],
+        isFirstMessage: true,
+        busy: false,
+      };
+      bot.sendMessage(msg.chat.id, `Chat mode started with claude in ${basename(currentProject)}. Send messages directly — no /command prefix needed.\n/endchat to exit.`);
+    }),
+  );
+
+  // --- /chatyolo ---
+  bot.onText(
+    /^\/chatyolo$/,
+    authed((msg) => {
+      const tool = config.cli_tools['claudeyolo'];
+      if (!tool) {
+        bot.sendMessage(msg.chat.id, 'No "claudeyolo" tool configured.');
+        return;
+      }
+      chatSession = {
+        command: tool.command,
+        args: [...tool.args],
+        isFirstMessage: true,
+        busy: false,
+      };
+      bot.sendMessage(msg.chat.id, `Chat mode started with claude (yolo) in ${basename(currentProject)}. Send messages directly — no /command prefix needed.\n/endchat to exit.`);
+    }),
+  );
+
+  // --- /endchat ---
+  bot.onText(
+    /^\/endchat$/,
+    authed((msg) => {
+      if (!chatSession) {
+        bot.sendMessage(msg.chat.id, 'No active chat session.');
+        return;
+      }
+      chatSession = null;
+      bot.sendMessage(msg.chat.id, 'Chat session ended.');
     }),
   );
 
@@ -326,6 +401,46 @@ async function main() {
       }),
     );
   }
+
+  // --- Chat mode catch-all ---
+  bot.on('message', async (msg) => {
+    if (!msg.from || !isAllowedUser(msg.from.id, allowedUsers)) return;
+    if (!msg.text || msg.text.startsWith('/')) return;
+    if (!chatSession) return;
+
+    if (chatSession.busy) {
+      bot.sendMessage(msg.chat.id, 'Still processing previous message...');
+      return;
+    }
+
+    chatSession.busy = true;
+    const prompt = msg.text;
+
+    try {
+      const args = [...chatSession.args];
+      if (!chatSession.isFirstMessage) {
+        args.push('--continue');
+      }
+      args.push(prompt);
+
+      bot.sendMessage(msg.chat.id, '...');
+
+      const output = await runCliTool(
+        chatSession.command,
+        args,
+        currentProject,
+        config.command_timeout_ms,
+      );
+      chatSession.isFirstMessage = false;
+      const formatted = formatOutput(output);
+      await sendFormatted(bot, msg.chat.id, formatted);
+    } catch (err: any) {
+      const formatted = formatOutput(`Error: ${err.message}`);
+      await sendFormatted(bot, msg.chat.id, formatted);
+    } finally {
+      if (chatSession) chatSession.busy = false;
+    }
+  });
 
   // Graceful shutdown
   process.on('SIGTERM', () => {
