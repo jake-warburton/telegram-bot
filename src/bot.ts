@@ -1,9 +1,12 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { exec, spawn } from 'node:child_process';
+import { exec, spawn, ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
+import { loadState, saveState } from './state.js';
+import type { BotState } from './state.js';
 
 const execAsync = promisify(exec);
 
@@ -131,22 +134,238 @@ function runCliTool(
   });
 }
 
+// --- Streaming CLI runner for chat mode ---
+
+interface StreamingHandle {
+  proc: ChildProcess;
+  events: EventEmitter;  // emits 'text', 'thinking', 'result', 'error', 'done'
+  kill: () => void;
+  promise: Promise<{ killed: boolean; result?: CliResult; error?: string }>;
+}
+
+function spawnStreamingCli(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+): StreamingHandle {
+  const fullCommand = [command, ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+  const proc = spawn('/bin/zsh', ['-li', '-c', fullCommand], { cwd });
+  const events = new EventEmitter();
+  let killed = false;
+
+  const kill = () => {
+    killed = true;
+    proc.kill('SIGTERM');
+  };
+
+  const promise = new Promise<{ killed: boolean; result?: CliResult; error?: string }>((resolve) => {
+    const timer = setTimeout(() => {
+      kill();
+      resolve({ killed: false, error: `Command timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    let stdout = '';
+    let stderr = '';
+    let accText = '';
+    let accThinking = '';
+    let resultJson: any = null;
+    let lineBuffer = '';
+
+    const processLine = (line: string) => {
+      try {
+        const json = JSON.parse(line);
+
+        if (json.type === 'content_block_start' && json.content_block?.type === 'thinking') {
+          const t = json.content_block.thinking ?? '';
+          accThinking += t;
+          if (t) events.emit('thinking', t);
+        }
+        if (json.type === 'content_block_delta' && json.delta?.type === 'thinking_delta') {
+          const t = json.delta.thinking ?? '';
+          accThinking += t;
+          if (t) events.emit('thinking', t);
+        }
+        if (json.type === 'content_block_start' && json.content_block?.type === 'text') {
+          const t = json.content_block.text ?? '';
+          accText += t;
+          if (t) events.emit('text', t);
+        }
+        if (json.type === 'content_block_delta' && json.delta?.type === 'text_delta') {
+          const t = json.delta.text ?? '';
+          accText += t;
+          if (t) events.emit('text', t);
+        }
+        if (json.type === 'result' && typeof json.result === 'string') {
+          resultJson = json;
+        }
+      } catch {}
+    };
+
+    proc.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      stdout += chunk;
+      lineBuffer += chunk;
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop()!;
+      for (const line of lines) {
+        if (line.trim()) processLine(line.trim());
+      }
+    });
+
+    proc.stderr.on('data', (data) => {
+      const line = data.toString();
+      if (!line.includes('no stdin data received')) {
+        stderr += line;
+      }
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      // Process any remaining buffered line
+      if (lineBuffer.trim()) processLine(lineBuffer.trim());
+
+      if (killed) {
+        resolve({ killed: true });
+        return;
+      }
+
+      if (resultJson) {
+        const parts: string[] = [];
+        if (resultJson.usage) {
+          const input = (resultJson.usage.input_tokens ?? 0) + (resultJson.usage.cache_read_input_tokens ?? 0) + (resultJson.usage.cache_creation_input_tokens ?? 0);
+          const output = resultJson.usage.output_tokens ?? 0;
+          parts.push(`${input.toLocaleString()} in / ${output.toLocaleString()} out`);
+        }
+        if (resultJson.duration_ms != null) {
+          parts.push(`${(resultJson.duration_ms / 1000).toFixed(1)}s`);
+        }
+        resolve({
+          killed: false,
+          result: {
+            text: resultJson.result,
+            stats: parts.length > 0 ? parts.join(' | ') : undefined,
+            thinking: accThinking || undefined,
+          },
+        });
+      } else if (code === 0) {
+        resolve({ killed: false, result: { text: accText || stdout.trim() } });
+      } else {
+        const output = (stdout + (stderr ? '\nSTDERR:\n' + stderr : '')).trim();
+        resolve({ killed: false, error: output || `Process exited with code ${code}` });
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ killed: false, error: err.message });
+    });
+  });
+
+  return { proc, events, kill, promise };
+}
+
+// --- Streaming Telegram message updater ---
+
+const STREAM_UPDATE_INTERVAL_MS = 2000;
+const TELEGRAM_MAX_LENGTH = 4096;
+
+function truncateForTelegram(text: string): string {
+  if (text.length <= TELEGRAM_MAX_LENGTH - 20) return text;
+  return text.slice(text.length - TELEGRAM_MAX_LENGTH + 40) + '\n[...truncated]';
+}
+
+// --- CLI output parser ---
+
+interface CliResult {
+  text: string;
+  stats?: string;
+  thinking?: string;
+}
+
+function parseCliOutput(raw: string): CliResult {
+  const lines = raw.split('\n').filter(l => l.trim());
+
+  let resultJson: any = null;
+  let thinking = '';
+
+  for (const line of lines) {
+    try {
+      const json = JSON.parse(line);
+
+      // Accumulate thinking from stream-json content blocks
+      if (json.type === 'content_block_start' && json.content_block?.type === 'thinking') {
+        thinking += json.content_block.thinking ?? '';
+      }
+      if (json.type === 'content_block_delta' && json.delta?.type === 'thinking_delta') {
+        thinking += json.delta.thinking ?? '';
+      }
+
+      // Capture the result line (works for both json and stream-json)
+      if (json.type === 'result' && typeof json.result === 'string') {
+        resultJson = json;
+      }
+    } catch {}
+  }
+
+  if (resultJson) {
+    const parts: string[] = [];
+    if (resultJson.usage) {
+      const input = (resultJson.usage.input_tokens ?? 0) + (resultJson.usage.cache_read_input_tokens ?? 0) + (resultJson.usage.cache_creation_input_tokens ?? 0);
+      const output = resultJson.usage.output_tokens ?? 0;
+      parts.push(`${input.toLocaleString()} in / ${output.toLocaleString()} out`);
+    }
+    if (resultJson.duration_ms != null) {
+      parts.push(`${(resultJson.duration_ms / 1000).toFixed(1)}s`);
+    }
+    return {
+      text: resultJson.result,
+      stats: parts.length > 0 ? parts.join(' | ') : undefined,
+      thinking: thinking || undefined,
+    };
+  }
+
+  return { text: raw };
+}
+
 // --- Output sender ---
 
 async function sendFormatted(
   bot: TelegramBot,
   chatId: number,
   output: FormattedOutput,
+  stats?: string,
 ): Promise<void> {
   if (output.type === 'text') {
-    await bot.sendMessage(chatId, output.content);
+    const message = stats ? `${output.content}\n\n${stats}` : output.content;
+    await bot.sendMessage(chatId, message);
   } else {
     const filePath = join(tmpdir(), `output-${Date.now()}.txt`);
     writeFileSync(filePath, output.content);
-    await bot.sendDocument(chatId, filePath, {
-      caption: 'Output exceeded 4096 chars — sent as file.',
-    });
+    const caption = stats
+      ? `Output sent as file.\n${stats}`
+      : 'Output exceeded 4096 chars — sent as file.';
+    await bot.sendDocument(chatId, filePath, { caption });
   }
+}
+
+async function sendCliResult(
+  bot: TelegramBot,
+  chatId: number,
+  parsed: CliResult,
+): Promise<void> {
+  if (parsed.thinking) {
+    const thinkingFormatted = formatOutput(parsed.thinking);
+    if (thinkingFormatted.type === 'text') {
+      await bot.sendMessage(chatId, `Thinking:\n${thinkingFormatted.content}`);
+    } else {
+      const filePath = join(tmpdir(), `thinking-${Date.now()}.txt`);
+      writeFileSync(filePath, thinkingFormatted.content);
+      await bot.sendDocument(chatId, filePath, { caption: 'Thinking' });
+    }
+  }
+  const formatted = formatOutput(parsed.text);
+  await sendFormatted(bot, chatId, formatted, parsed.stats);
 }
 
 // --- Bot setup ---
@@ -169,7 +388,9 @@ async function main() {
   }
 
   const config = loadConfig(join(import.meta.dirname, '..', 'config.json'));
-  let currentProject = config.default_project;
+  const statePath = join(import.meta.dirname, '..', 'state.json');
+  const state = loadState(statePath);
+  let currentProject = state.currentProject || config.default_project;
 
   const bot = new TelegramBot(token, { polling: true });
 
@@ -187,11 +408,19 @@ async function main() {
     { command: 'projects', description: 'List project directories' },
     { command: 'cd', description: 'Set working directory' },
     { command: 'help', description: 'List commands' },
+    { command: 'restart', description: 'Restart the bot' },
   ];
   await bot.setMyCommands(botCommands);
 
   console.log(`Bot started. Allowed users: ${JSON.stringify(allowedUsers)}`);
   console.log('Listening for messages...');
+
+  // Notify allowed users that the bot has started
+  for (const userId of allowedUsers) {
+    bot.sendMessage(userId, `Bot started. CWD: ${basename(currentProject)}`).catch((err: any) => {
+      console.error(`Failed to send startup message to ${userId}: ${err.message}`);
+    });
+  }
 
   // Log all incoming messages
   bot.on('message', (msg) => {
@@ -264,6 +493,8 @@ async function main() {
         return;
       }
       currentProject = project;
+      state.currentProject = currentProject;
+      saveState(statePath, state);
       bot.sendMessage(msg.chat.id, `Working directory: ${currentProject}`);
     }),
   );
@@ -311,10 +542,21 @@ async function main() {
         '/status — System status',
         '/projects — List project directories',
         '/cd <project> — Set working directory',
+        '/restart — Restart the bot',
         '/help — Show this message',
       ].join('\n');
 
       bot.sendMessage(msg.chat.id, text);
+    }),
+  );
+
+  // --- /restart ---
+  bot.onText(
+    /^\/restart$/,
+    authed(async (msg) => {
+      await bot.sendMessage(msg.chat.id, 'Restarting...');
+      bot.stopPolling();
+      process.exit(0);
     }),
   );
 
@@ -324,6 +566,7 @@ async function main() {
     args: string[];  // base args (e.g. ["--print", "--dangerously-skip-permissions"])
     isFirstMessage: boolean;
     busy: boolean;
+    activeHandle?: StreamingHandle;  // current running process
   }
 
   let chatSession: ChatSession | null = null;
@@ -397,14 +640,118 @@ async function main() {
             currentProject,
             config.command_timeout_ms,
           );
-          const formatted = formatOutput(output);
-          await sendFormatted(bot, msg.chat.id, formatted);
+          const parsed = parseCliOutput(output);
+          await sendCliResult(bot, msg.chat.id, parsed);
         } catch (err: any) {
           const formatted = formatOutput(`Error: ${err.message}`);
           await sendFormatted(bot, msg.chat.id, formatted);
         }
       }),
     );
+  }
+
+  // --- Chat mode: run a single turn with streaming output ---
+  async function runChatTurn(chatId: number, prompt: string): Promise<void> {
+    if (!chatSession) return;
+
+    chatSession.busy = true;
+
+    const args = [...chatSession.args];
+    if (!chatSession.isFirstMessage) {
+      args.push('--continue');
+    }
+    args.push(prompt);
+
+    // Send initial "Thinking..." message that we'll edit with streaming content
+    const statusMsg = await bot.sendMessage(chatId, 'Thinking...');
+    const msgId = statusMsg.message_id;
+
+    const handle = spawnStreamingCli(
+      chatSession.command,
+      args,
+      currentProject,
+      config.command_timeout_ms,
+    );
+    chatSession.activeHandle = handle;
+
+    // Accumulate streamed text and update Telegram message periodically
+    let streamedText = '';
+    let lastUpdateText = '';
+    let phase: 'thinking' | 'responding' = 'thinking';
+
+    handle.events.on('thinking', (delta: string) => {
+      // We don't stream thinking to the live message — too noisy
+      // It'll be sent separately at the end if present
+    });
+
+    handle.events.on('text', (delta: string) => {
+      if (phase === 'thinking') phase = 'responding';
+      streamedText += delta;
+    });
+
+    // Periodically edit the Telegram message with accumulated text
+    const updateInterval = setInterval(async () => {
+      if (streamedText && streamedText !== lastUpdateText) {
+        const display = phase === 'thinking'
+          ? 'Thinking...'
+          : truncateForTelegram(streamedText);
+        lastUpdateText = streamedText;
+        try {
+          await bot.editMessageText(display, { chat_id: chatId, message_id: msgId });
+        } catch {}
+      }
+    }, STREAM_UPDATE_INTERVAL_MS);
+
+    try {
+      const outcome = await handle.promise;
+      clearInterval(updateInterval);
+
+      if (!chatSession) return; // session ended while running
+
+      if (outcome.killed) {
+        // Process was killed by a steer — update the message to indicate interruption
+        const partial = streamedText
+          ? truncateForTelegram(streamedText + '\n\n[interrupted]')
+          : '[interrupted by new message]';
+        try {
+          await bot.editMessageText(partial, { chat_id: chatId, message_id: msgId });
+        } catch {}
+        chatSession.isFirstMessage = false;
+        return;
+      }
+
+      chatSession.isFirstMessage = false;
+      chatSession.activeHandle = undefined;
+
+      if (outcome.error) {
+        try {
+          await bot.editMessageText(
+            truncateForTelegram(`Error: ${outcome.error}`),
+            { chat_id: chatId, message_id: msgId },
+          );
+        } catch {}
+        return;
+      }
+
+      if (outcome.result) {
+        // Delete the streaming message — we'll send the final result properly formatted
+        try { await bot.deleteMessage(chatId, msgId); } catch {}
+        await sendCliResult(bot, chatId, outcome.result);
+      }
+    } catch (err: any) {
+      clearInterval(updateInterval);
+      try {
+        await bot.editMessageText(
+          truncateForTelegram(`Error: ${err.message}`),
+          { chat_id: chatId, message_id: msgId },
+        );
+      } catch {}
+    } finally {
+      if (chatSession) {
+        chatSession.busy = false;
+        chatSession.activeHandle = undefined;
+      }
+    }
   }
 
   // --- Chat mode catch-all ---
@@ -414,37 +761,22 @@ async function main() {
     if (!chatSession) return;
 
     if (chatSession.busy) {
-      bot.sendMessage(msg.chat.id, 'Still processing previous message...');
-      return;
-    }
-
-    chatSession.busy = true;
-    const prompt = msg.text;
-
-    try {
-      const args = [...chatSession.args];
-      if (!chatSession.isFirstMessage) {
-        args.push('--continue');
+      // Kill the running process and steer with the new message
+      const handle = chatSession.activeHandle;
+      if (handle) {
+        bot.sendMessage(msg.chat.id, `Steering: "${msg.text}"`);
+        handle.kill();
+        // Wait for the killed process to clean up
+        await handle.promise;
       }
-      args.push(prompt);
-
-      bot.sendMessage(msg.chat.id, '...');
-
-      const output = await runCliTool(
-        chatSession.command,
-        args,
-        currentProject,
-        config.command_timeout_ms,
-      );
-      chatSession.isFirstMessage = false;
-      const formatted = formatOutput(output);
-      await sendFormatted(bot, msg.chat.id, formatted);
-    } catch (err: any) {
-      const formatted = formatOutput(`Error: ${err.message}`);
-      await sendFormatted(bot, msg.chat.id, formatted);
-    } finally {
-      if (chatSession) chatSession.busy = false;
+      if (chatSession) {
+        chatSession.busy = false;
+        chatSession.activeHandle = undefined;
+      }
     }
+
+    // Run the new turn (either first message or steer via --continue)
+    await runChatTurn(msg.chat.id, msg.text);
   });
 
   // Graceful shutdown
