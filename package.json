@@ -8,6 +8,7 @@
     "doc": "docs"
   },
   "scripts": {
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
     "start": "tsx src/bot.ts",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -24,6 +25,7 @@
   },
   "homepage": "https://github.com/jake-warburton/telegram-bot#readme",
   "dependencies": {
+    "node-pty": "^1.1.0",
     "node-telegram-bot-api": "^0.67.0"
   },
   "devDependencies": {

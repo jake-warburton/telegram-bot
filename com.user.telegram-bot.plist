@@ -6,7 +6,10 @@
     <string>com.user.telegram-bot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__INSTALL_DIR__/run.sh</string>
+        <string>/bin/zsh</string>
+        <string>-l</string>
+        <string>-c</string>
+        <string>export $(cat __HOME__/.config/telegram-bot/.env | xargs); exec "$(which node)" --import tsx/esm __INSTALL_DIR__/src/bot.ts</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

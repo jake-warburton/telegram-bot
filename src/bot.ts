@@ -1,5 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { exec, spawn, ChildProcess } from 'node:child_process';
+import * as pty from 'node-pty';
 import { EventEmitter } from 'node:events';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -422,6 +423,8 @@ async function main() {
     { command: 'status', description: 'System status' },
     { command: 'projects', description: 'List project directories' },
     { command: 'cd', description: 'Set working directory' },
+    { command: 'remote', description: 'Start Claude remote control session' },
+    { command: 'endremote', description: 'Stop remote control session' },
     { command: 'help', description: 'List commands' },
     { command: 'restart', description: 'Restart the bot' },
   ];
@@ -573,6 +576,8 @@ async function main() {
         '/chat — Start interactive Claude chat',
         '/chatyolo — Start Claude chat (skip permissions)',
         '/endchat — End chat session',
+        '/remote — Start Claude remote control session',
+        '/endremote — Stop remote control session',
         '/run <cmd> — Run a shell command',
         '/status — System status',
         '/projects — List project directories',
@@ -592,6 +597,115 @@ async function main() {
       await bot.sendMessage(msg.chat.id, 'Restarting...');
       bot.stopPolling();
       process.exit(0);
+    }),
+  );
+
+  // --- Remote control state ---
+  let remotePty: pty.IPty | null = null;
+
+  // --- /remote ---
+  bot.onText(
+    /^\/remote$/,
+    authed(async (msg) => {
+      if (remotePty) {
+        bot.sendMessage(msg.chat.id, 'Remote control session already active. Use /endremote to stop it.');
+        return;
+      }
+
+      const statusMsg = await bot.sendMessage(msg.chat.id, 'Starting remote control session...');
+
+      let claudePath: string;
+      try {
+        claudePath = (await execAsync('which claude')).stdout.trim();
+      } catch {
+        // Fallback for launchd environments where PATH is limited
+        const fallbackPaths = [
+          `${process.env.HOME}/.local/bin/claude`,
+          '/usr/local/bin/claude',
+        ];
+        const fs = await import('fs');
+        claudePath = fallbackPaths.find((p) => fs.existsSync(p)) || '';
+        if (!claudePath) {
+          bot.editMessageText('Could not find claude binary. Check PATH or install Claude CLI.', {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+          }).catch(() => {});
+          return;
+        }
+      }
+      console.log(`[remote] Using claude at: ${claudePath}`);
+      const proc = pty.spawn(claudePath, [], {
+        cwd: currentProject,
+        cols: 120,
+        rows: 30,
+        env: process.env as Record<string, string>,
+      });
+      remotePty = proc;
+
+      let output = '';
+      let urlSent = false;
+      let sentRemoteCmd = false;
+
+      const stripAnsi = (s: string) =>
+        s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '').replace(/\x1B[^a-zA-Z\[]*[a-zA-Z]/g, '');
+
+      proc.onData((data) => {
+        const cleaned = stripAnsi(data);
+        output += cleaned;
+        const trimmed = cleaned.trim();
+        if (trimmed) console.log(`[remote] ${trimmed.slice(0, 200)}`);
+
+        // Wait for the actual prompt character before sending /remote-control
+        if (!sentRemoteCmd && output.includes('❯')) {
+          sentRemoteCmd = true;
+          console.log('[remote] Prompt detected, sending /remote-control');
+          setTimeout(() => proc.write('/remote-control\r'), 500);
+        }
+
+        // Look for the remote control URL
+        const urlMatch = output.match(/(https:\/\/claude\.ai\/\S+)/);
+        if (urlMatch && !urlSent) {
+          urlSent = true;
+          const url = urlMatch[0].replace(/[\x00-\x1F\s]+$/g, '');
+          bot.editMessageText(`Remote control session started.\n\n${url}`, {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+          }).catch(() => {});
+        }
+      });
+
+      proc.onExit(({ exitCode }) => {
+        console.log(`[remote] process exited with code ${exitCode}`);
+        remotePty = null;
+        bot.sendMessage(msg.chat.id, 'Remote control session ended.').catch(() => {});
+      });
+
+      // Timeout if no URL found
+      setTimeout(() => {
+        if (!urlSent && remotePty === proc) {
+          console.log(`[remote] timeout. Output so far: ${output.slice(-500)}`);
+          bot.editMessageText('Failed to get remote control URL (timeout). Check logs.', {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+          }).catch(() => {});
+          proc.kill();
+          remotePty = null;
+        }
+      }, 30000);
+    }),
+  );
+
+  // --- /endremote ---
+  bot.onText(
+    /^\/endremote$/,
+    authed(async (msg) => {
+      if (!remotePty) {
+        bot.sendMessage(msg.chat.id, 'No active remote control session.');
+        return;
+      }
+      remotePty.kill();
+      remotePty = null;
+      bot.sendMessage(msg.chat.id, 'Remote control session stopped.');
     }),
   );
 
