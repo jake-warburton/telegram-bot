@@ -9,7 +9,7 @@
         <string>/bin/zsh</string>
         <string>-l</string>
         <string>-c</string>
-        <string>export $(cat __HOME__/.config/telegram-bot/.env | xargs); exec "$(which node)" --import tsx/esm __INSTALL_DIR__/src/bot.ts</string>
+        <string>cd "__INSTALL_DIR__" &amp;&amp; if [ -f "__HOME__/.config/telegram-bot/.env" ]; then set -a; source "__HOME__/.config/telegram-bot/.env"; set +a; fi; exec "$(which node)" --import tsx/esm src/bot.ts</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

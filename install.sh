@@ -7,6 +7,8 @@ PLIST_NAME="com.user.telegram-bot"
 PLIST_SRC="$INSTALL_DIR/$PLIST_NAME.plist"
 PLIST_DST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
 LOG_DIR="$HOME_DIR/Library/Logs/telegram-bot"
+ENV_DIR="$HOME_DIR/.config/telegram-bot"
+ENV_DST="$ENV_DIR/.env"
 
 echo "=== Telegram Bot Installer ==="
 
@@ -23,6 +25,10 @@ fi
 
 # Create log directory
 mkdir -p "$LOG_DIR"
+mkdir -p "$ENV_DIR"
+
+# Copy env file to a launchd-friendly location outside protected folders
+cp "$INSTALL_DIR/.env" "$ENV_DST"
 
 # Make run.sh executable
 chmod +x "$INSTALL_DIR/run.sh"
@@ -41,5 +47,6 @@ launchctl load "$PLIST_DST"
 echo ""
 echo "Installed and started!"
 echo "  Logs: $LOG_DIR/"
+echo "  Env:  $ENV_DST"
 echo "  Stop: launchctl unload $PLIST_DST"
 echo "  Start: launchctl load $PLIST_DST"
