@@ -6,6 +6,8 @@ import {
   buildChatTranscriptTailCommand,
   buildCodexExecArgs,
   buildCodexChatArgs,
+  buildCompactedCodexChatArgs,
+  buildCompactedChatTurnPrompt,
   buildCodexMcpAddArgs,
   buildComputerUseCodexInstructions,
   buildComputerUseCodexPrompt,
@@ -139,6 +141,41 @@ describe('buildCodexChatArgs', () => {
   });
 });
 
+describe('buildCompactedCodexChatArgs', () => {
+  it('uses an ephemeral exec session for compacted chat turns', () => {
+    expect(buildCompactedCodexChatArgs(['--quiet', '--full-auto'], 'hello')).toEqual([
+      'exec',
+      '--full-auto',
+      '--skip-git-repo-check',
+      '--ephemeral',
+      '--json',
+      'hello',
+    ]);
+  });
+});
+
+describe('buildCompactedChatTurnPrompt', () => {
+  it('includes compact summary and recent turns before the latest message', () => {
+    const prompt = buildCompactedChatTurnPrompt(
+      'Ship the next change',
+      'Computer-use guidance:\n- Use the `computer-use` MCP tools when needed.',
+      'Earlier summary line',
+      [
+        {
+          user: 'What changed?',
+          assistant: 'I updated the tests.',
+        },
+      ],
+    );
+
+    expect(prompt).toContain('Conversation memory:');
+    expect(prompt).toContain('Earlier summary line');
+    expect(prompt).toContain('User: What changed?');
+    expect(prompt).toContain('Assistant: I updated the tests.');
+    expect(prompt).toContain('Latest user message:\nShip the next change');
+  });
+});
+
 describe('parseCliOutput', () => {
   it('parses codex json output into message text and usage stats', () => {
     const output = [
@@ -263,6 +300,7 @@ describe('buildAutonomousTaskPrompt', () => {
       '/Users/jake/repos/my-app',
       2,
       5,
+      {},
     );
 
     expect(prompt).toContain('Goal: Ship a pricing page');
@@ -276,12 +314,32 @@ describe('buildAutonomousTaskPrompt', () => {
       '/Users/jake/repos/my-app',
       1,
       5,
-      undefined,
-      'session-123',
+      {
+        sessionId: 'session-123',
+      },
     );
 
     expect(prompt).toContain('Use the `computer-use` MCP tools');
     expect(prompt).toContain('session-123');
+  });
+
+  it('includes overnight tdd requirements when the mode is overnight', () => {
+    const prompt = buildAutonomousTaskPrompt(
+      'Ship the onboarding flow',
+      '/Users/jake/repos/my-app',
+      3,
+      48,
+      {
+        mode: 'overnight',
+        phase: 'green',
+        memory: 'Attempt 2 (red): added a failing test',
+      },
+    );
+
+    expect(prompt).toContain('Mode: overnight TDD loop');
+    expect(prompt).toContain('red, green, refactor, then verify');
+    expect(prompt).toContain('Current TDD phase: green');
+    expect(prompt).toContain('Compacted task memory:');
   });
 });
 
@@ -291,16 +349,19 @@ describe('buildAutonomousTaskStatusSummary', () => {
       id: 'task-1',
       goal: 'Build a landing page',
       status: 'running',
+      mode: 'overnight',
+      phase: 'green',
       attempt: 2,
       maxAttempts: 5,
       startedAt: '2026-03-31T00:00:00.000Z',
       updatedAt: '2026-03-31T00:10:00.000Z',
       currentProject: '/Users/jake/repos/my-app',
+      deadlineAt: '2026-03-31T08:00:00.000Z',
       lastSummary: 'Implemented the hero section.',
     };
 
     expect(buildAutonomousTaskStatusSummary(task)).toBe(
-      'Task: task-1\nStatus: running\nAttempt: 2/5\nProject: my-app\nGoal: Build a landing page\nLast summary: Implemented the hero section.',
+      'Task: task-1\nStatus: running\nMode: overnight\nAttempt: 2/5\nProject: my-app\nGoal: Build a landing page\nPhase: green\nDeadline: 2026-03-31T08:00:00.000Z\nLast summary: Implemented the hero section.',
     );
   });
 });

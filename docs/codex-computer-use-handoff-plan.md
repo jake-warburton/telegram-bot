@@ -22,6 +22,7 @@ What already works:
 
 - `telegram-bot` bot-side integration for the first slice is implemented in this repo
 - `telegram-bot` now has an MVP `/task` mode for bounded autonomous Codex runs
+- `telegram-bot` now has `/taskovernight` for longer red/green/refactor/verify Codex loops
 - `computer-use-host` exists as a standalone repo
 - host API supports:
   - `GET /health`
@@ -41,8 +42,9 @@ What already works:
 - `telegram-bot` now tries to prepare `computer-use-mcp` for `/codexchat` and `/codexchatyolo`
   - it checks for the sibling repo
   - it attempts idempotent Codex MCP registration
-  - it creates or reuses a computer-use session for the first Codex turn
-  - it injects screenshot-before / screenshot-after guidance into the first Codex prompt
+  - it creates or reuses a computer-use session for Codex chat and task flows
+  - it injects screenshot-before / screenshot-after guidance into the compacted Codex prompt used for each Telegram turn
+- `/codexchat` no longer relies on an endlessly growing Codex thread for continuity; it rebuilds each turn from compact local memory plus the current task message
 - screenshot capture works on this Mac after Screen Recording permission was granted
 - native `.mov` screen recording works through `/usr/sbin/screencapture`
 - this repo includes a browser-form fallback in [`src/telegram-browser-photo.ts`](/Users/jakewarburton/Documents/repos/telegram-bot/src/telegram-browser-photo.ts) for sandboxed agent runs where direct shell access to `api.telegram.org` is blocked but Chrome still works
@@ -141,6 +143,7 @@ When starting a Codex chat session:
 
 - ensure a computer-use session exists
 - include brief system instructions telling Codex when to use the MCP tools
+- keep continuity in a bounded local summary so token usage does not grow without limit between Telegram messages
 - encourage screenshot-before and screenshot-after for GUI actions
 
 Suggested session instruction:

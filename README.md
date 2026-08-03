@@ -34,6 +34,8 @@ COMPUTER_USE_HOST_URL=http://127.0.0.1:4317
 COMPUTER_USE_HOST_REPO=/Users/jakewarburton/Documents/repos/computer-use-host
 COMPUTER_USE_MCP_REPO=/Users/jakewarburton/Documents/repos/computer-use-mcp
 TELEGRAM_TASK_MAX_ATTEMPTS=5
+TELEGRAM_TASK_OVERNIGHT_MAX_ATTEMPTS=48
+TELEGRAM_TASK_OVERNIGHT_MAX_RUNTIME_HOURS=8
 ```
 
 Edit `config.json` to add your project directories and CLI tools.
@@ -49,7 +51,7 @@ This installs a launchd service that starts on boot and restarts on crash. Durin
 
 For computer-use screenshots, the bot will try to start the standalone host from [`computer-use-host`](/Users/jakewarburton/Documents/repos/computer-use-host) automatically with `npm run ensure`. Override the repo location with `COMPUTER_USE_HOST_REPO` if needed.
 
-For `/codexchat` and `/codexchatyolo`, the bot will also look for [`computer-use-mcp`](/Users/jakewarburton/Documents/repos/computer-use-mcp), register it with Codex if needed, and create or reuse a computer-use session before the first Codex turn. If the MCP repo or `src/server.js` is still missing, chat still starts but without GUI tools.
+For `/codexchat` and `/codexchatyolo`, the bot will also look for [`computer-use-mcp`](/Users/jakewarburton/Documents/repos/computer-use-mcp), register it with Codex if needed, and create or reuse a computer-use session before chat starts. Each Telegram turn runs through a compacted Codex prompt so conversation context stays bounded instead of growing an unbounded Codex thread. If the MCP repo or `src/server.js` is still missing, chat still starts but without GUI tools.
 
 ### 4. Prevent Sleep
 
@@ -73,16 +75,17 @@ System Settings → Battery → Options → Prevent automatic sleeping when the 
 | `/cd <project>` | Switch working directory for this chat |
 | `/sessionstart` | Start a computer-use session |
 | `/sessionscreenshot` | Capture a screenshot from the computer-use host |
-| `/task <goal>` | Run an autonomous Codex task with retries |
+| `/task <goal>` | Run a bounded autonomous Codex task |
+| `/taskovernight <goal>` | Run an overnight autonomous TDD Codex loop |
 | `/taskstatus` | Show autonomous task status |
 | `/taskstop` | Stop the active autonomous task |
 | `/help` | List commands |
 
 Project selection is now tracked per Telegram chat, so changing directories in one chat does not affect another chat.
 
-`/codexchat` now seeds the first Codex turn with the active computer-use session id and screenshot-before/screenshot-after guidance when the `computer-use` MCP server is available.
+`/codexchat` now carries Codex chat continuity in compact local memory. Each new Telegram message is sent as a fresh ephemeral Codex run with a bounded summary of earlier turns, plus the active computer-use session id and screenshot-before/screenshot-after guidance when the `computer-use` MCP server is available.
 
-`/task` is a first autonomous runner mode. It runs Codex non-interactively with a bounded retry budget, persists task status per Telegram chat, and can reuse the active computer-use session for screenshot-based verification between attempts.
+`/task` remains the bounded autonomous runner mode. `/taskovernight` adds a longer-running overnight mode that pushes Codex through a red/green/refactor/verify loop, keeps compact attempt memory between runs, persists richer task status, and can reuse the active computer-use session for screenshot-based verification between attempts.
 
 For day-to-day use, you do not need to rely on the slash-command picker. The bot now exposes a persistent reply keyboard with guided flows for common actions such as:
 
@@ -144,8 +147,14 @@ The bot now logs a short diagnosis in `stderr.log` to distinguish between:
 Optional env vars:
 
 - `TELEGRAM_TASK_MAX_ATTEMPTS`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_ATTEMPTS`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_RUNTIME_HOURS`
 
-Default: `5`
+Defaults:
+
+- `TELEGRAM_TASK_MAX_ATTEMPTS=5`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_ATTEMPTS=48`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_RUNTIME_HOURS=8`
 
 ## Browser Fallback For Agent Screenshot Sends
 

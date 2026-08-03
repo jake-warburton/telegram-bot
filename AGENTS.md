@@ -25,8 +25,10 @@ Do not leave repo capability notes stale after changing behavior.
 
 - runs Claude and Codex CLI commands from Telegram
 - supports interactive `/claudechat`, `/codexchat`, and yolo variants
+- keeps `/codexchat` context compact by rolling forward local summaries instead of endlessly resuming the same Codex thread
 - mirrors interactive chat sessions into local transcript files and can open a Terminal viewer for them
 - supports autonomous `/task` runs with bounded retries
+- supports `/taskovernight` for longer-running red/green/refactor/verify Codex loops
 - tracks working directory per Telegram chat
 - runs arbitrary shell commands with `/run`
 - reports status, project list, and current project
@@ -58,6 +60,7 @@ Do not leave repo capability notes stale after changing behavior.
 - `/sessionrecordstop`
 - `/sessionartifacts`
 - `/task`
+- `/taskovernight`
 - `/taskstatus`
 - `/taskstop`
 
@@ -108,6 +111,7 @@ At the time of writing, this repo already:
 - ensures a computer-use session exists for Codex
 - tries to register the `computer-use` MCP server with Codex
 - injects computer-use guidance into the first Codex turn
+- compacts Codex chat context between Telegram messages and re-seeds the next turn from bounded local memory
 
 Relevant code in [`src/bot.ts`](/Users/jakewarburton/Documents/repos/telegram-bot/src/bot.ts):
 
@@ -138,6 +142,8 @@ Computer use:
 - `COMPUTER_USE_HOST_AUTOSTART`
 - `COMPUTER_USE_WATCH_INTERVAL_MS`
 - `TELEGRAM_TASK_MAX_ATTEMPTS`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_ATTEMPTS`
+- `TELEGRAM_TASK_OVERNIGHT_MAX_RUNTIME_HOURS`
 
 ## How `/codexchat` Works Here
 
@@ -146,22 +152,28 @@ When `/codexchat` starts, the bot tries to:
 1. ensure the computer-use host is healthy
 2. ensure the `computer-use` MCP server is registered in Codex
 3. create or reuse a computer-use session
-4. prepend computer-use instructions to the first Codex prompt
+4. prepend computer-use instructions to the compacted Codex prompt it uses for each Telegram turn
 
 So if a user asks Codex to use Firefox or inspect the screen, the expected path is through MCP tools, not raw shell commands.
 
+To keep token usage bounded, the bot does not endlessly resume the same Codex thread. It keeps a compact local summary plus a few recent turns and sends each new Telegram message as a fresh ephemeral Codex run.
+
 ## How `/task` Works Here
 
-`/task <goal>` is a first autonomous runner mode inside `telegram-bot`.
+`/task <goal>` is the bounded autonomous runner mode inside `telegram-bot`.
 
-It currently:
+`/taskovernight <goal>` is the longer-running unattended mode.
+
+The shared runner currently:
 
 1. picks the Codex autonomous tool config
 2. prepares computer-use context
 3. runs Codex non-interactively with a structured output schema
-4. retries up to a bounded budget
-5. persists task status per Telegram chat
-6. allows `/taskstatus` and `/taskstop`
+4. keeps compact attempt memory between runs
+5. retries up to a bounded attempt budget
+6. for overnight mode, enforces a red/green/refactor/verify loop with a runtime deadline
+7. persists task status per Telegram chat
+8. allows `/taskstatus` and `/taskstop`
 
 This is the current in-repo MVP before extracting fuller orchestration into `self-dev-runner`.
 

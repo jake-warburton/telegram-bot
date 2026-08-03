@@ -10,11 +10,14 @@ export interface ChatState {
 export interface TaskState {
   id: string;
   goal: string;
-  status: 'running' | 'completed' | 'blocked' | 'failed' | 'stopped';
+  status: 'running' | 'completed' | 'blocked' | 'failed' | 'stopped' | 'exhausted';
+  mode?: 'standard' | 'overnight';
+  phase?: 'red' | 'green' | 'refactor' | 'verify';
   attempt: number;
   maxAttempts: number;
   startedAt: string;
   updatedAt: string;
+  deadlineAt?: string;
   currentProject: string;
   lastSummary?: string;
 }

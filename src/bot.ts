@@ -23,6 +23,8 @@ interface CliTool {
 }
 
 type ChatProvider = 'claude' | 'codex';
+type TaskMode = 'standard' | 'overnight';
+type TaskPhase = 'red' | 'green' | 'refactor' | 'verify';
 
 const CODEX_SKIP_GIT_REPO_CHECK_ARG = '--skip-git-repo-check';
 const CHAT_TRANSCRIPT_TAIL_LINES = 200;
@@ -150,12 +152,21 @@ interface AutonomousTaskTurnResult {
   status: 'completed' | 'continue' | 'blocked';
   summary: string;
   evidence: string;
+  phase?: TaskPhase;
+  tests_ran?: string;
   next_focus?: string;
 }
 
 const COMPUTER_USE_MCP_SERVER_NAME = 'computer-use';
 const TELEGRAM_POLLING_DIAGNOSTIC_INTERVAL_MS = 60_000;
 const AUTONOMOUS_TASK_DEFAULT_MAX_ATTEMPTS = 5;
+const AUTONOMOUS_TASK_OVERNIGHT_DEFAULT_MAX_ATTEMPTS = 48;
+const AUTONOMOUS_TASK_OVERNIGHT_DEFAULT_MAX_RUNTIME_HOURS = 8;
+const COMPACT_CHAT_RECENT_TURNS = 2;
+const COMPACT_CHAT_SUMMARY_MAX_CHARS = 4_000;
+const COMPACT_CHAT_TURN_SUMMARY_MAX_CHARS = 900;
+const AUTONOMOUS_TASK_RECENT_MEMORY_ENTRIES = 4;
+const AUTONOMOUS_TASK_MEMORY_MAX_CHARS = 4_000;
 
 interface TelegramHostLookupResult {
   host: string;
@@ -328,6 +339,14 @@ export function buildCodexChatArgs(
   return buildCodexExecArgs(toolArgs, prompt);
 }
 
+export function buildCompactedCodexChatArgs(
+  toolArgs: string[],
+  prompt: string,
+): string[] {
+  const args = normalizeCodexToolArgs(toolArgs);
+  return ['exec', ...args, CODEX_SKIP_GIT_REPO_CHECK_ARG, '--ephemeral', '--json', prompt];
+}
+
 export function buildComputerUseScreenshotCaption(
   sessionId: string,
   summary: string,
@@ -402,19 +421,104 @@ export function buildComputerUseCodexInstructions(sessionId: string): string {
   ].join('\n');
 }
 
+function normalizeCompactText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function clampCompactText(text: string, maxChars: number): string {
+  const normalized = normalizeCompactText(text);
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxChars - 16).trimEnd()} [...truncated]`;
+}
+
+function appendCompactedMemory(
+  existing: string | undefined,
+  entry: string,
+  maxChars: number,
+): string {
+  const next = existing ? `${existing}\n${entry}` : entry;
+  if (next.length <= maxChars) {
+    return next;
+  }
+
+  return next.slice(next.length - maxChars);
+}
+
+interface CompactChatTurn {
+  user: string;
+  assistant: string;
+}
+
+interface AutonomousTaskPromptOptions {
+  mode?: TaskMode;
+  phase?: TaskPhase;
+  memory?: string;
+  previousSummary?: string;
+  sessionId?: string;
+}
+
+export function buildCompactedChatTurnPrompt(
+  prompt: string,
+  preamble?: string,
+  compactSummary?: string,
+  recentTurns: CompactChatTurn[] = [],
+): string {
+  const lines: string[] = [];
+
+  if (preamble) {
+    lines.push(preamble);
+    lines.push('');
+  }
+
+  if (compactSummary || recentTurns.length > 0) {
+    lines.push('Conversation memory:');
+    lines.push('- This is a compacted continuation of an existing Telegram chat.');
+    lines.push('- Prefer the current repository state and fresh tool output over stale chat memory.');
+
+    if (compactSummary) {
+      lines.push('');
+      lines.push('Earlier summary:');
+      lines.push(compactSummary);
+    }
+
+    if (recentTurns.length > 0) {
+      lines.push('');
+      lines.push('Recent turns:');
+      for (const turn of recentTurns) {
+        lines.push(`User: ${turn.user}`);
+        lines.push(`Assistant: ${turn.assistant}`);
+        lines.push('');
+      }
+      if (lines.at(-1) === '') {
+        lines.pop();
+      }
+    }
+
+    lines.push('');
+  }
+
+  lines.push('Latest user message:');
+  lines.push(prompt);
+  return lines.join('\n');
+}
+
 export function buildAutonomousTaskPrompt(
   goal: string,
   currentProject: string,
   attempt: number,
   maxAttempts: number,
-  previousSummary?: string,
-  sessionId?: string,
+  options: AutonomousTaskPromptOptions = {},
 ): string {
+  const mode = options.mode ?? 'standard';
   const lines = [
     'You are running an autonomous implementation task from Telegram.',
     `Working directory: ${currentProject}`,
     `Attempt: ${attempt}/${maxAttempts}`,
     `Goal: ${goal}`,
+    `Mode: ${mode === 'overnight' ? 'overnight TDD loop' : 'standard autonomous run'}`,
     'Requirements:',
     '- Make concrete progress on the task. Do not stop at a plan unless you are blocked.',
     '- Use tests, logs, screenshots, recordings, accessibility state, and app inspection when they help verify the task.',
@@ -425,15 +529,33 @@ export function buildAutonomousTaskPrompt(
     '- Return status "blocked" if human input, missing credentials, or an external dependency is blocking progress.',
   ];
 
-  if (sessionId) {
-    lines.push('');
-    lines.push(buildComputerUseCodexInstructions(sessionId));
+  if (mode === 'overnight') {
+    lines.push('- Run in small TDD increments: red, green, refactor, then verify.');
+    lines.push('- Start each increment by identifying or adding a failing test or observable check.');
+    lines.push('- Do not claim green unless you ran the relevant tests or checks and they passed.');
+    lines.push('- Use refactor steps to improve naming, structure, and test clarity after green.');
+    lines.push('- If the task is too large, cut scope to a smaller vertical slice and keep the loop moving.');
   }
 
-  if (previousSummary) {
+  if (options.phase) {
+    lines.push(`- Current TDD phase: ${options.phase}.`);
+  }
+
+  if (options.sessionId) {
+    lines.push('');
+    lines.push(buildComputerUseCodexInstructions(options.sessionId));
+  }
+
+  if (options.memory) {
+    lines.push('');
+    lines.push('Compacted task memory:');
+    lines.push(options.memory);
+  }
+
+  if (options.previousSummary) {
     lines.push('');
     lines.push('Previous attempt summary:');
-    lines.push(previousSummary);
+    lines.push(options.previousSummary);
   }
 
   lines.push('');
@@ -446,16 +568,89 @@ export function buildAutonomousTaskStatusSummary(task: StoredTaskState): string 
   const lines = [
     `Task: ${task.id}`,
     `Status: ${task.status}`,
+    `Mode: ${task.mode ?? 'standard'}`,
     `Attempt: ${task.attempt}/${task.maxAttempts}`,
     `Project: ${basename(task.currentProject)}`,
     `Goal: ${task.goal}`,
   ];
+
+  if (task.phase) {
+    lines.push(`Phase: ${task.phase}`);
+  }
+
+  if (task.deadlineAt) {
+    lines.push(`Deadline: ${task.deadlineAt}`);
+  }
 
   if (task.lastSummary) {
     lines.push(`Last summary: ${task.lastSummary}`);
   }
 
   return lines.join('\n');
+}
+
+function formatCompactChatTurn(turn: CompactChatTurn): string {
+  return `User: ${turn.user}\nAssistant: ${turn.assistant}`;
+}
+
+function updateCompactChatHistory(
+  compactSummary: string | undefined,
+  recentTurns: CompactChatTurn[],
+  prompt: string,
+  response: string,
+): { compactSummary?: string; recentTurns: CompactChatTurn[] } {
+  const nextTurn: CompactChatTurn = {
+    user: clampCompactText(prompt, 280),
+    assistant: clampCompactText(response, 520),
+  };
+  const nextRecentTurns = [...recentTurns];
+  let nextSummary = compactSummary;
+
+  if (nextRecentTurns.length >= COMPACT_CHAT_RECENT_TURNS) {
+    const shifted = nextRecentTurns.shift();
+    if (shifted) {
+      nextSummary = appendCompactedMemory(
+        nextSummary,
+        formatCompactChatTurn(shifted),
+        COMPACT_CHAT_SUMMARY_MAX_CHARS,
+      );
+    }
+  }
+
+  nextRecentTurns.push(nextTurn);
+  return { compactSummary: nextSummary, recentTurns: nextRecentTurns };
+}
+
+function formatAutonomousTaskMemoryEntry(
+  attempt: number,
+  result: AutonomousTaskTurnResult,
+): string {
+  const lines = [
+    `Attempt ${attempt}${result.phase ? ` (${result.phase})` : ''}: ${clampCompactText(result.summary, 180)}`,
+    `Evidence: ${clampCompactText(result.evidence, 220)}`,
+  ];
+
+  if (result.tests_ran) {
+    lines.push(`Tests: ${clampCompactText(result.tests_ran, 180)}`);
+  }
+
+  if (result.next_focus) {
+    lines.push(`Next focus: ${clampCompactText(result.next_focus, 180)}`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildAutonomousTaskMemory(
+  compactSummary: string | undefined,
+  recentEntries: string[],
+): string | undefined {
+  const parts = [compactSummary, recentEntries.join('\n\n')].filter((value): value is string => Boolean(value && value.trim()));
+  if (parts.length === 0) {
+    return undefined;
+  }
+
+  return parts.join('\n\n');
 }
 
 type GuidedAction =
@@ -494,6 +689,13 @@ function buildAutonomousTaskSchema(): Record<string, unknown> {
         type: 'string',
         minLength: 1,
       },
+      phase: {
+        type: 'string',
+        enum: ['red', 'green', 'refactor', 'verify'],
+      },
+      tests_ran: {
+        type: 'string',
+      },
       next_focus: {
         type: 'string',
       },
@@ -501,9 +703,32 @@ function buildAutonomousTaskSchema(): Record<string, unknown> {
   };
 }
 
-function getAutonomousTaskMaxAttempts(): number {
-  const raw = parseInt(process.env.TELEGRAM_TASK_MAX_ATTEMPTS ?? `${AUTONOMOUS_TASK_DEFAULT_MAX_ATTEMPTS}`, 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : AUTONOMOUS_TASK_DEFAULT_MAX_ATTEMPTS;
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = parseInt(process.env[name] ?? `${fallback}`, 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function getAutonomousTaskMaxAttempts(mode: TaskMode): number {
+  if (mode === 'overnight') {
+    return parsePositiveIntEnv(
+      'TELEGRAM_TASK_OVERNIGHT_MAX_ATTEMPTS',
+      AUTONOMOUS_TASK_OVERNIGHT_DEFAULT_MAX_ATTEMPTS,
+    );
+  }
+
+  return parsePositiveIntEnv('TELEGRAM_TASK_MAX_ATTEMPTS', AUTONOMOUS_TASK_DEFAULT_MAX_ATTEMPTS);
+}
+
+function getAutonomousTaskMaxRuntimeMs(mode: TaskMode): number | undefined {
+  if (mode !== 'overnight') {
+    return undefined;
+  }
+
+  const hours = parsePositiveIntEnv(
+    'TELEGRAM_TASK_OVERNIGHT_MAX_RUNTIME_HOURS',
+    AUTONOMOUS_TASK_OVERNIGHT_DEFAULT_MAX_RUNTIME_HOURS,
+  );
+  return hours * 60 * 60 * 1000;
 }
 
 function buildTelegramFileOptions(filePath: string): { filename: string; contentType: string } {
@@ -1171,6 +1396,12 @@ function parseAutonomousTaskTurnResult(raw: string): AutonomousTaskTurnResult {
     || parsed.summary.trim() === ''
     || typeof parsed.evidence !== 'string'
     || parsed.evidence.trim() === ''
+    || (parsed.phase != null
+      && parsed.phase !== 'red'
+      && parsed.phase !== 'green'
+      && parsed.phase !== 'refactor'
+      && parsed.phase !== 'verify')
+    || (parsed.tests_ran != null && typeof parsed.tests_ran !== 'string')
   ) {
     throw new Error('Codex returned an invalid autonomous task result.');
   }
@@ -1179,6 +1410,10 @@ function parseAutonomousTaskTurnResult(raw: string): AutonomousTaskTurnResult {
     status: parsed.status,
     summary: parsed.summary.trim(),
     evidence: parsed.evidence.trim(),
+    phase: parsed.phase,
+    tests_ran: typeof parsed.tests_ran === 'string' && parsed.tests_ran.trim()
+      ? parsed.tests_ran.trim()
+      : undefined,
     next_focus: typeof parsed.next_focus === 'string' && parsed.next_focus.trim()
       ? parsed.next_focus.trim()
       : undefined,
@@ -1740,6 +1975,7 @@ async function main() {
     { command: 'sessionrecordstart', description: 'Start computer-use screen recording' },
     { command: 'sessionrecordstop', description: 'Stop computer-use screen recording' },
     { command: 'task', description: 'Run an autonomous Codex task' },
+    { command: 'taskovernight', description: 'Run an overnight TDD Codex task loop' },
     { command: 'taskstatus', description: 'Show autonomous task status' },
     { command: 'taskstop', description: 'Stop the active autonomous task' },
     { command: 'telegramsendphotojs', description: 'Get Telegram Web photo-send bookmarklet' },
@@ -1878,7 +2114,7 @@ async function main() {
     await sendMenuMessage(chatId, list || 'No projects configured.');
   }
 
-  async function startTaskFromGoal(chatId: number, goal: string): Promise<void> {
+  async function startTaskFromGoal(chatId: number, goal: string, mode: TaskMode = 'standard'): Promise<void> {
     const existingTask = taskRuns.get(chatId);
     if (existingTask) {
       await sendMenuMessage(chatId, `A task is already running.\n${buildAutonomousTaskStatusSummary(existingTask.task)}`);
@@ -1906,29 +2142,37 @@ async function main() {
       chatState,
       chatId,
     );
+    const maxRuntimeMs = getAutonomousTaskMaxRuntimeMs(mode);
 
     const task: StoredTaskState = {
       id: `task-${Date.now()}`,
       goal,
       status: 'running',
+      mode,
       attempt: 0,
-      maxAttempts: getAutonomousTaskMaxAttempts(),
+      maxAttempts: getAutonomousTaskMaxAttempts(mode),
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       currentProject,
+      deadlineAt: maxRuntimeMs
+        ? new Date(Date.now() + maxRuntimeMs).toISOString()
+        : undefined,
     };
     updateTaskState(chatId, task);
 
     const taskRun: TaskRun = {
       task,
       stopRequested: false,
+      recentMemoryEntries: [],
     };
     taskRuns.set(chatId, taskRun);
 
     const lines = [
       `Autonomous task started with ${taskTool.key} in ${basename(currentProject)}.`,
       `Goal: ${goal}`,
+      `Mode: ${mode === 'overnight' ? 'overnight TDD loop' : 'standard'}`,
       `Retry budget: ${task.maxAttempts}`,
+      ...(task.deadlineAt ? [`Deadline: ${task.deadlineAt}`] : []),
       context.status,
     ];
     await sendMenuMessage(chatId, lines.join('\n'));
@@ -2022,6 +2266,8 @@ async function main() {
     stopRequested: boolean;
     activeHandle?: CommandHandle;
     promise?: Promise<void>;
+    compactMemory?: string;
+    recentMemoryEntries: string[];
   }
 
   const taskRuns = new Map<number, TaskRun>();
@@ -2091,6 +2337,18 @@ async function main() {
           return;
         }
 
+        if (taskRun.task.deadlineAt && Date.now() >= Date.parse(taskRun.task.deadlineAt)) {
+          taskRun.task.status = 'exhausted';
+          taskRun.task.updatedAt = new Date().toISOString();
+          taskRun.task.lastSummary = 'Overnight runtime budget reached.';
+          updateTaskState(chatId, taskRun.task);
+          await bot.sendMessage(
+            chatId,
+            `Task stopped after reaching the runtime budget.\n${buildAutonomousTaskStatusSummary(taskRun.task)}`,
+          );
+          return;
+        }
+
         taskRun.task.attempt = attempt;
         taskRun.task.updatedAt = new Date().toISOString();
         updateTaskState(chatId, taskRun.task);
@@ -2116,8 +2374,13 @@ async function main() {
           taskRun.task.currentProject,
           attempt,
           taskRun.task.maxAttempts,
-          previousSummary,
-          sessionId,
+          {
+            mode: taskRun.task.mode ?? 'standard',
+            phase: taskRun.task.phase,
+            memory: buildAutonomousTaskMemory(taskRun.compactMemory, taskRun.recentMemoryEntries),
+            previousSummary,
+            sessionId,
+          },
         );
 
         const attemptRun = await runAutonomousTaskAttempt(
@@ -2154,11 +2417,26 @@ async function main() {
         previousSummary = [
           `Summary: ${result.summary}`,
           `Evidence: ${result.evidence}`,
+          ...(result.tests_ran ? [`Tests: ${result.tests_ran}`] : []),
           ...(result.next_focus ? [`Next focus: ${result.next_focus}`] : []),
         ].join('\n');
 
         taskRun.task.updatedAt = new Date().toISOString();
         taskRun.task.lastSummary = result.summary;
+        taskRun.task.phase = result.phase ?? taskRun.task.phase;
+
+        const memoryEntry = formatAutonomousTaskMemoryEntry(attempt, result);
+        if (taskRun.recentMemoryEntries.length >= AUTONOMOUS_TASK_RECENT_MEMORY_ENTRIES) {
+          const shifted = taskRun.recentMemoryEntries.shift();
+          if (shifted) {
+            taskRun.compactMemory = appendCompactedMemory(
+              taskRun.compactMemory,
+              shifted,
+              AUTONOMOUS_TASK_MEMORY_MAX_CHARS,
+            );
+          }
+        }
+        taskRun.recentMemoryEntries.push(memoryEntry);
 
         const latestSessionId = getChatState(chatId).computerUseSessionId;
         if (latestSessionId) {
@@ -2177,7 +2455,7 @@ async function main() {
           updateTaskState(chatId, taskRun.task);
           await bot.sendMessage(
             chatId,
-            `Task completed.\n${buildAutonomousTaskStatusSummary(taskRun.task)}\nVerification: ${result.evidence}`,
+            `Task completed.\n${buildAutonomousTaskStatusSummary(taskRun.task)}\nVerification: ${result.evidence}${result.tests_ran ? `\nTests: ${result.tests_ran}` : ''}`,
           );
           return;
         }
@@ -2187,18 +2465,18 @@ async function main() {
           updateTaskState(chatId, taskRun.task);
           await bot.sendMessage(
             chatId,
-            `Task blocked.\n${buildAutonomousTaskStatusSummary(taskRun.task)}\nEvidence: ${result.evidence}${result.next_focus ? `\nBlocker: ${result.next_focus}` : ''}`,
+            `Task blocked.\n${buildAutonomousTaskStatusSummary(taskRun.task)}\nEvidence: ${result.evidence}${result.tests_ran ? `\nTests: ${result.tests_ran}` : ''}${result.next_focus ? `\nBlocker: ${result.next_focus}` : ''}`,
           );
           return;
         }
 
         await bot.sendMessage(
           chatId,
-          `Task continuing after attempt ${attempt}/${taskRun.task.maxAttempts}.\nSummary: ${result.summary}${result.next_focus ? `\nNext focus: ${result.next_focus}` : ''}`,
+          `Task continuing after attempt ${attempt}/${taskRun.task.maxAttempts}.${result.phase ? `\nPhase: ${result.phase}` : ''}\nSummary: ${result.summary}${result.tests_ran ? `\nTests: ${result.tests_ran}` : ''}${result.next_focus ? `\nNext focus: ${result.next_focus}` : ''}`,
         );
       }
 
-      taskRun.task.status = 'failed';
+      taskRun.task.status = 'exhausted';
       taskRun.task.updatedAt = new Date().toISOString();
       taskRun.task.lastSummary = taskRun.task.lastSummary ?? 'Retry budget exhausted.';
       updateTaskState(chatId, taskRun.task);
@@ -2299,6 +2577,7 @@ async function main() {
         '/sessionrecordstart — Start computer-use screen recording',
         '/sessionrecordstop — Stop computer-use screen recording',
         '/task <goal> — Run an autonomous Codex task',
+        '/taskovernight <goal> — Run an overnight TDD Codex task loop',
         '/taskstatus — Show autonomous task status',
         '/taskstop — Stop the active autonomous task',
         '/telegramsendphotojs — Get Telegram Web photo-send bookmarklet',
@@ -2324,7 +2603,15 @@ async function main() {
   bot.onText(
     /^\/task\s+([\s\S]+)/,
     authed(async (msg, match) => {
-      await startTaskFromGoal(msg.chat.id, match![1].trim());
+      await startTaskFromGoal(msg.chat.id, match![1].trim(), 'standard');
+    }),
+  );
+
+  // --- /taskovernight ---
+  bot.onText(
+    /^\/taskovernight\s+([\s\S]+)/,
+    authed(async (msg, match) => {
+      await startTaskFromGoal(msg.chat.id, match![1].trim(), 'overnight');
     }),
   );
 
@@ -2701,7 +2988,9 @@ async function main() {
     args: string[];
     sessionId?: string;
     isFirstMessage: boolean;
-    firstPromptPrefix?: string;
+    promptPreamble?: string;
+    compactSummary?: string;
+    recentTurns: CompactChatTurn[];
     busy: boolean;
     activeHandle?: StreamingHandle;
     transcriptPath: string;
@@ -2758,7 +3047,7 @@ async function main() {
       transcriptViewerStatus += `\nLocal Terminal viewer could not be opened automatically: ${error?.message ?? error}`;
     }
 
-    let firstPromptPrefix: string | undefined;
+    let promptPreamble: string | undefined;
     let computerUseStatus: string | null = null;
 
     if (provider === 'codex') {
@@ -2768,7 +3057,7 @@ async function main() {
         chatState,
         msg.chat.id,
       );
-      firstPromptPrefix = context.instructions;
+      promptPreamble = context.instructions;
       computerUseStatus = context.status;
     }
 
@@ -2777,7 +3066,8 @@ async function main() {
       command: tool.command,
       args: [...tool.args],
       isFirstMessage: true,
-      firstPromptPrefix,
+      promptPreamble,
+      recentTurns: [],
       busy: false,
       transcriptPath,
     });
@@ -2788,6 +3078,9 @@ async function main() {
       `Chat mode started with ${label} in ${basename(currentProject)}. Send messages directly — no /command prefix needed.`,
       '/endchat to exit.',
     ];
+    if (provider === 'codex') {
+      lines.push('Codex chat context compaction is on.');
+    }
     if (computerUseStatus) {
       lines.push(computerUseStatus);
     }
@@ -3096,6 +3389,7 @@ async function main() {
         '/codexchatyolo — Start Codex chat (full auto)',
         '/chatterminal — Open the local Terminal transcript viewer',
         '/task <goal> — Run an autonomous Codex task',
+        '/taskovernight <goal> — Run an overnight TDD Codex task loop',
         '/taskstatus — Show autonomous task status',
         '/taskstop — Stop the active autonomous task',
       ].join('\n');
@@ -3111,22 +3405,24 @@ async function main() {
     const sessionAtStart = chatSession;
     const currentProject = getCurrentProject(chatId);
     sessionAtStart.busy = true;
-    const promptWithComputerUse = sessionAtStart.provider === 'codex'
-      && sessionAtStart.isFirstMessage
-      && sessionAtStart.firstPromptPrefix
-      ? `${sessionAtStart.firstPromptPrefix}\n\nUser request:\n${prompt}`
+    const promptForTool = sessionAtStart.provider === 'codex'
+      ? buildCompactedChatTurnPrompt(
+        prompt,
+        sessionAtStart.promptPreamble,
+        sessionAtStart.compactSummary,
+        sessionAtStart.recentTurns,
+      )
       : prompt;
 
     const args = sessionAtStart.provider === 'codex'
-      ? buildCodexChatArgs(
+      ? buildCompactedCodexChatArgs(
         sessionAtStart.args,
-        promptWithComputerUse,
-        sessionAtStart.isFirstMessage ? undefined : sessionAtStart.sessionId,
+        promptForTool,
       )
       : [
         ...sessionAtStart.args,
         ...(sessionAtStart.isFirstMessage ? [] : ['--continue']),
-        promptWithComputerUse,
+        promptForTool,
       ];
 
     appendChatTranscript(
@@ -3236,6 +3532,16 @@ async function main() {
           sessionAtStart.transcriptPath,
           `\n[result]\n${outcome.result.text}${outcome.result.stats ? `\n\n[stats] ${outcome.result.stats}` : ''}\n`,
         );
+        if (sessionAtStart.provider === 'codex') {
+          const nextHistory = updateCompactChatHistory(
+            sessionAtStart.compactSummary,
+            sessionAtStart.recentTurns,
+            prompt,
+            outcome.result.text,
+          );
+          sessionAtStart.compactSummary = nextHistory.compactSummary;
+          sessionAtStart.recentTurns = nextHistory.recentTurns;
+        }
         // Delete the streaming message — we'll send the final result properly formatted
         try { await bot.deleteMessage(chatId, msgId); } catch {}
         await sendCliResult(bot, chatId, outcome.result);

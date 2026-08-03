@@ -7,6 +7,7 @@ Allow the Telegram bot to connect to the standalone computer-use stack so it can
 - start and stop computer-use sessions
 - request screenshots from the active session
 - receive screenshots and recordings on the phone
+- feed screenshots and host state into autonomous overnight Codex loops
 - approve or deny risky actions
 - review final artifacts after an unattended run
 
@@ -78,6 +79,8 @@ Recordings:
 ## Watch mode
 
 Watch mode is the key unattended workflow.
+
+It also supports the overnight `/taskovernight` path, where the bot can keep sending Codex fresh screenshots and post-attempt verification artifacts without requiring an ever-growing chat context.
 
 When enabled, the bot should automatically send media for:
 
